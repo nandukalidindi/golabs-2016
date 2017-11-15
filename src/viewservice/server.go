@@ -18,6 +18,9 @@ type ViewServer struct {
 
 
 	// Your declarations here.
+	recentPings map[string]time.Time
+	currentView View
+	isCurrentPrimaryAcked bool
 }
 
 //
@@ -25,8 +28,40 @@ type ViewServer struct {
 //
 func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 
-	// Your code here.
+	// LOCK BECAUSE OF CONCURRENT REQUESTS TO VIEW SERVER
+	vs.mu.Lock()
 
+	vs.recentPings[args.Me] = time.Now()
+
+	if vs.currentView.Primary == "" {
+		vs.addPrimary()
+	}
+
+	if vs.currentView.Backup == "" {
+		vs.addBackup()
+	}
+
+	if args.Me == vs.currentView.Primary || args.Me == vs.currentView.Backup {
+		if vs.currentView.Viewnum > args.Viewnum { //a crash!
+			if args.Me == vs.currentView.Primary {
+				vs.removePrimary()
+			}
+
+			if args.Me == vs.currentView.Backup {
+				vs.removeBackup()
+			}
+		}
+		if args.Me == vs.currentView.Primary {
+			if args.Viewnum == vs.currentView.Viewnum {
+				vs.isCurrentPrimaryAcked = true
+			}
+		}
+	}
+
+	reply.View = vs.currentView
+
+	vs.mu.Unlock()
+	// LOCK BECAUSE OF CONCURRENT REQUESTS TO VIEW SERVER
 	return nil
 }
 
@@ -35,7 +70,12 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 //
 func (vs *ViewServer) Get(args *GetArgs, reply *GetReply) error {
 
-	// Your code here.
+	// NOT ACTUALLY REQUIRED BUT LETS LOCK EVERYTHING DOWN ANYWAY
+	// LOCK BECAUSE OF CONCURRENT REQUESTS TO VIEW SERVER
+	vs.mu.Lock()
+	reply.View = vs.currentView
+	vs.mu.Unlock()
+	// LOCK BECAUSE OF CONCURRENT REQUESTS TO VIEW SERVER
 
 	return nil
 }
@@ -49,6 +89,79 @@ func (vs *ViewServer) Get(args *GetArgs, reply *GetReply) error {
 func (vs *ViewServer) tick() {
 
 	// Your code here.
+	// PERIODICALLY CHECK IF THE CURRENT VIEW IS VALID AND TAKE NECESSARY ACTIONS
+	// LIKE PROMOTING BACKUP TO PRIMARY OR PROMOTING IDLE SERVER TO BACKUP ETC.
+	// LOCK BECAUSE OF CONCURRENT REQUESTS TO VIEW SERVER
+	vs.mu.Lock()
+	for server, recentPing := range vs.recentPings {
+		if time.Now().Sub(recentPing).Seconds() * 10 >= DeadPings {
+			if server == vs.currentView.Primary {
+				vs.removePrimary()
+			}
+			if server == vs.currentView.Backup {
+				vs.removeBackup()
+			}
+			delete(vs.recentPings, server)
+		}
+	}
+	vs.mu.Unlock()
+	// LOCK BECAUSE OF CONCURRENT REQUESTS TO VIEW SERVER
+}
+
+func (vs *ViewServer) addPrimary() {
+	// SELECTING PRIMARY FOR THE FIRST TIME
+	if vs.currentView.Primary == "" {
+		vs.currentView.Primary = vs.findActiveServer()
+		vs.updateView()
+	}
+}
+
+func (vs *ViewServer) removePrimary() {
+	// REMOVE PRIMARY AND PROMOTE BACKUP TO PRIMARY
+	if vs.isCurrentPrimaryAcked {
+		vs.currentView.Primary = vs.currentView.Backup
+		vs.currentView.Backup = vs.findActiveServer()
+		vs.updateView()
+	}
+}
+
+func (vs *ViewServer) addBackup() {
+	// FIND BACKUP FROM A LIST OF IDLE SERVERS
+	availableBackup := vs.findActiveServer()
+
+	if availableBackup != "" {
+		vs.currentView.Backup = availableBackup
+		vs.updateView()
+	}
+}
+
+func (vs *ViewServer) removeBackup() {
+	// REMOVE BACKUP AND PROBABLY PROMOTE AN IDLE SERVER 
+	// OR LET IT BE BECAUSE BACKUP CAN BE NIL
+	if vs.isCurrentPrimaryAcked {
+		vs.currentView.Backup = ""
+		vs.updateView()
+	}
+}
+
+func (vs *ViewServer) updateView() {
+	// UPDATE OR MOVE THE CURRENT VIEW LIKE THE SLIDING WINDOW
+	// TO DISCARD OLD INVALID VIEW STATE 
+	vs.currentView.Viewnum++
+	vs.isCurrentPrimaryAcked = false
+}
+
+func (vs *ViewServer) findActiveServer() string {
+	// FIND SERVER FROM THE LIST OF GIVEN SERVERS THAT ARE RECORDED
+	// IN THE recentPings HASHMAP AND RETURN A SERVER THAT IS RESPONSIVE
+	// WITHIN THE DEADINTERVALS TIME FRAME
+	for server, recentPing := range vs.recentPings {
+		liveServer := time.Now().Sub(recentPing).Seconds() * 10 < DeadPings
+		if liveServer && server != vs.currentView.Primary && server != vs.currentView.Backup {
+			return server
+		}
+	}
+	return ""
 }
 
 //
@@ -77,6 +190,9 @@ func StartServer(me string) *ViewServer {
 	vs := new(ViewServer)
 	vs.me = me
 	// Your vs.* initializations here.
+	vs.recentPings = make(map[string]time.Time)
+	vs.currentView = View{0, "", ""}
+	vs.isCurrentPrimaryAcked = false
 
 	// tell net/rpc about our RPC server and handlers.
 	rpcs := rpc.NewServer()
