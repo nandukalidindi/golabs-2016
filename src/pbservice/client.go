@@ -6,11 +6,14 @@ import "fmt"
 
 import "crypto/rand"
 import "math/big"
+import "time"
 
 
 type Clerk struct {
 	vs *viewservice.Clerk
 	// Your declarations here
+	view  *viewservice.View
+	me string
 }
 
 // this may come in handy.
@@ -25,7 +28,8 @@ func MakeClerk(vshost string, me string) *Clerk {
 	ck := new(Clerk)
 	ck.vs = viewservice.MakeClerk(me, vshost)
 	// Your ck.* initializations here
-
+	// TO TRACK THE NAME OF THE CURRENT SERVER THE CLIENT IS TRYING TO TALK TO
+	ck.me = me
 	return ck
 }
 
@@ -64,6 +68,24 @@ func call(srv string, rpcname string,
 	return false
 }
 
+func (ck *Clerk) getPrimary(cache bool) string {
+	// FOR PREVENTING REDUNDANT RPCs TO VIEW SERVER
+	// IF THE CACHE FLAG IS FALSE THEN GET THE CURRENT PRIMARY
+	if ck.view == nil || !cache {
+		view, ok := ck.vs.Get()
+		if ok {
+			ck.view = &view
+			return view.Primary
+		} else { ck.view = nil }
+	} else {
+		if ck.view != nil {
+			return ck.view.Primary
+		}
+	}
+
+	return ""
+}
+
 //
 // fetch a key's value from the current primary;
 // if they key has never been set, return "".
@@ -74,8 +96,28 @@ func call(srv string, rpcname string,
 func (ck *Clerk) Get(key string) string {
 
 	// Your code here.
+	// SEND RPC TO EXECUTE PBServer.Get on BEHALF OF PRIMARY
+	var reply GetReply 
+	args := &GetArgs{key, nrand(), ck.me}
 
-	return "???"
+	cache := true
+
+	for {
+		primary := ck.getPrimary(cache)
+		ok := call(primary, "PBServer.Get", args, &reply)
+
+		if !ok || reply.Err == ErrWrongServer {
+			cache = false			
+		} else {
+			if reply.Err == ErrNoKey {
+				return ""
+			}
+			return reply.Value			
+		}
+
+		time.Sleep(viewservice.PingInterval)
+	}
+	return reply.Value
 }
 
 //
@@ -84,6 +126,26 @@ func (ck *Clerk) Get(key string) string {
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 
 	// Your code here.
+	// SEND RPC TO EXECUTE PBServer.PutAppend on BEHALF OF PRIMARY 
+	// (PUT OR APPEND IS DECIDED BY THE op PARAMETER)
+	var reply PutAppendReply
+	shouldAppend := op == "Append"
+	args := &PutAppendArgs{key, value, shouldAppend, nrand(), ck.me}
+
+	cache := true
+	for {
+		primary := ck.getPrimary(cache)
+		ok := call(primary, "PBServer.PutAppend", args, &reply)
+
+		if !ok || reply.Err != "" {	
+			reply.Err = ""		
+			cache = false
+		} else {
+			break
+		}
+		// EVERY PING INTERVAL TO PREVENT A BLAST OF RPCs
+		time.Sleep(viewservice.PingInterval)
+	}
 }
 
 //
