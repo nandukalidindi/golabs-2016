@@ -11,9 +11,10 @@ import "os"
 import "syscall"
 import "encoding/gob"
 import "math/rand"
+import "time"
 
 
-const Debug = 0
+const Debug = 1
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -24,9 +25,17 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 
 
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+    // Your definitions here.
+    // Field names must start with capital letters,
+    // otherwise RPC will break.
+    From string
+    ClerkInstance int
+    PaxosInstance int
+  
+    Type string
+    Key string
+    Value string
+    OldAppend string
 }
 
 type KVPaxos struct {
@@ -38,18 +47,176 @@ type KVPaxos struct {
 	px         *paxos.Paxos
 
 	// Your definitions here.
+	log map[int]*Op
+    responses map[string]*Op
+    store map[string]string
+    opChannelMap map[int]chan *Op
+    highest int
 }
 
 
 func (kv *KVPaxos) Get(args *GetArgs, reply *GetReply) error {
-	// Your code here.
+	instance, c := kv.instanceChannel()
+
+	proposedVal := Op{args.From, args.Instance, instance, "Get", args.Key, "", ""}
+
+	// START ELECTION
+	kv.px.Start(instance, proposedVal)
+
+	// BLOCK UNTIL VALUE
+	acceptedVal := <- c
+	
+	if acceptedVal.From != args.From || acceptedVal.ClerkInstance != args.Instance {
+		reply.Err = "ERROR DURING GET"
+		kv.mu.Lock()
+		delete(kv.opChannelMap, instance)
+		c <- &Op{}
+		kv.mu.Unlock()
+		return nil
+	}
+	reply.Err = ""
+	reply.Value = acceptedVal.Value
+
+	kv.mu.Lock()
+	delete(kv.opChannelMap, instance)
+	c <- &Op{}
+	kv.mu.Unlock()
 	return nil
 }
 
 func (kv *KVPaxos) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
-	// Your code here.
+	instance, c := kv.instanceChannel()
+	opType := "Put"
+	if args.Op == "Append" {
+		opType = "Append"
+	}
 
+	proposedVal := Op{args.From, args.Instance, instance, opType, args.Key, args.Value, ""}
+
+	// START ELECTION
+	kv.px.Start(instance, proposedVal)
+
+	// BLOCK UNTIL VALUE
+	acceptedVal := <- c
+	
+	if acceptedVal.From != args.From  || acceptedVal.ClerkInstance != args.Instance {
+		reply.Err = "ERROR DURING PUT"
+		
+		kv.mu.Lock()
+		delete(kv.opChannelMap, instance)
+		c <- &Op{}
+		kv.mu.Unlock()
+		return nil
+	}
+
+	reply.Err = ""
+	reply.OldAppend = acceptedVal.OldAppend
+	
+	kv.mu.Lock()
+	delete(kv.opChannelMap, instance)
+	c <- &Op{}
+	kv.mu.Unlock()
 	return nil
+}
+
+func (kv *KVPaxos) instanceChannel() (int, chan *Op) {
+	kv.mu.Lock()
+	instance := kv.px.Max() + 1
+	for _,ok := kv.opChannelMap[instance]; ok || kv.highest >= instance; {
+		instance++
+		_,ok = kv.opChannelMap[instance]
+	}
+	channel := make(chan *Op)
+	kv.opChannelMap[instance] = channel
+	kv.mu.Unlock()
+	return instance, channel
+}
+
+func (kv *KVPaxos) duplicateCheck(from string, ClerkInstance int) (bool, *Op) {
+	if duplicate, ok := kv.responses[from]; ok {
+		if duplicate.ClerkInstance == ClerkInstance {
+			return true, duplicate
+		} else if ClerkInstance < duplicate.ClerkInstance {
+			return true, &Op{From:"None"}
+		}
+	}
+	return false, &Op{}
+}
+
+func (kv *KVPaxos) getStatus() {
+	instance := 0
+	restarted := false
+
+	to := 10 * time.Millisecond
+	for kv.isdead() == false {
+		decided, r := kv.px.Status(instance)
+		if decided == paxos.Fate(1) {
+			op, isOp := r.(Op)
+			if isOp {
+				kv.mu.Lock()
+				if op.From != "None" {
+					kv.commit(instance, &op)
+				} else {
+					kv.highest = instance
+					kv.px.Done(instance)
+				}
+				if ch, ok := kv.opChannelMap[instance]; ok {
+					ch <- &op
+					kv.mu.Unlock()
+					<- ch
+				} else {
+					kv.mu.Unlock()
+				}
+			}
+			instance++
+			restarted = false
+		} else {
+			// SCHEDULE SLEEP AS MENTIONED IN THE LAB PAGE 9
+			time.Sleep(to)
+			if to < 25 * time.Millisecond {
+				to *= 2
+			} else {
+				if !restarted {
+					to = 10 * time.Millisecond
+					kv.px.Start(instance, Op{From: "None"})
+					time.Sleep(time.Millisecond)
+					restarted = true
+				}
+			}
+		}
+	}
+}
+
+func (kv *KVPaxos) commit(instance int, op *Op) {
+	if dup, d := kv.duplicateCheck(op.From, op.ClerkInstance); !dup {
+		switch op.Type {
+		case "Put":
+			op.OldAppend = kv.store[op.Key]
+			kv.store[op.Key] = op.Value
+		case "Append":
+			prev := kv.store[op.Key]
+			value := prev + op.Value
+			op.OldAppend = prev
+			kv.store[op.Key] = value
+		case "Get":
+			if v, ok := kv.store[op.Key]; ok {
+				op.Value = v
+			}
+		}
+		kv.responses[op.From] = op
+	} else {
+		if d.From != "None" {
+			op.From = d.From
+			op.ClerkInstance = d.ClerkInstance
+			op.PaxosInstance = d.PaxosInstance
+			op.Type = d.Type
+			op.Key = d.Key
+			op.Value = d.Value
+			op.OldAppend = d.OldAppend
+		}
+	}
+	kv.highest = instance
+	kv.px.Done(instance)
 }
 
 // tell the server to shut itself down.
@@ -94,6 +261,11 @@ func StartServer(servers []string, me int) *KVPaxos {
 	kv.me = me
 
 	// Your initialization code here.
+	kv.store = make(map[string]string)
+    kv.log = make(map[int]*Op)
+    kv.responses = make(map[string]*Op)
+    kv.opChannelMap = make(map[int]chan *Op)
+    kv.highest = -1
 
 	rpcs := rpc.NewServer()
 	rpcs.Register(kv)
@@ -107,7 +279,7 @@ func StartServer(servers []string, me int) *KVPaxos {
 	}
 	kv.l = l
 
-
+	go kv.getStatus()
 	// please do not change any of the following code,
 	// or do anything to subvert it.
 

@@ -3,14 +3,18 @@ package kvpaxos
 import "net/rpc"
 import "crypto/rand"
 import "math/big"
-
+import "strconv"
+import "math"
 import "fmt"
 
 type Clerk struct {
 	servers []string
 	// You will have to modify this struct.
+	me string
+    instance int
 }
 
+// THE SAME NRAND FUNCTION USED IN PBSERVICE
 func nrand() int64 {
 	max := big.NewInt(int64(1) << 62)
 	bigx, _ := rand.Int(rand.Reader, max)
@@ -22,7 +26,9 @@ func MakeClerk(servers []string) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
-	return ck
+	ck.me = strconv.FormatInt(nrand(), 10)
+    ck.instance = 0
+    return ck
 }
 
 //
@@ -65,15 +71,41 @@ func call(srv string, rpcname string,
 // keeps trying forever in the face of all other errors.
 //
 func (ck *Clerk) Get(key string) string {
-	// You will have to modify this function.
-	return ""
+
+	// SEND RPC TO EXECUTE KVPaxos.Get
+	var reply GetReply	
+	args := &GetArgs{key, ck.me, ck.instance}
+
+	dest := int(math.Mod(float64(ck.instance), float64(len(ck.servers))))
+	ck.instance++
+	ok := call(ck.servers[dest], "KVPaxos.Get", args, &reply);
+	for !ok || reply.Err != "" {
+		reply.Err = ""
+		// ROUND ROBIN CALLING OF SERVERS
+		dest = int(math.Mod(float64(dest+1), float64(len(ck.servers))))
+		ok = call(ck.servers[dest], "KVPaxos.Get", args, &reply);
+	}
+	return reply.Value
 }
 
 //
 // shared by Put and Append.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	// You will have to modify this function.
+
+	// SEND RPC TO EXECUTE KVPaxos.PutAppend
+	// (PUT OR APPEND IS DECIDED BY THE op PARAMETER)
+	var reply PutAppendReply	
+	args := &PutAppendArgs{key, value, op, ck.me, ck.instance}
+	dest := int(math.Mod(float64(ck.instance), float64(len(ck.servers))))
+	ck.instance++
+	ok := call(ck.servers[dest], "KVPaxos.PutAppend", args, &reply);
+	for !ok || reply.Err != "" {
+		// ROUND ROBIN CALLING OF SERVERs
+		dest = int(math.Mod(float64(dest+1), float64(len(ck.servers))))
+		reply.Err = ""
+		ok = call(ck.servers[dest], "KVPaxos.PutAppend", args, &reply);
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {
