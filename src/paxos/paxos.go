@@ -30,6 +30,8 @@ import "sync"
 import "sync/atomic"
 import "fmt"
 import "math/rand"
+import "time"
+// import "strconv"
 
 
 // px.Status() return values, indicating
@@ -38,10 +40,19 @@ import "math/rand"
 // or it was agreed but forgotten (i.e. < Min()).
 type Fate int
 
+const Debug = 1
+
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if Debug > 0 {
+		log.Printf(format, a...)
+	}
+	return
+}
+
 const (
 	Decided   Fate = iota + 1
-	Pending        // not yet decided.
-	Forgotten      // decided but forgotten.
+	Pending        //2 not yet decided.
+	Forgotten      //3 decided but forgotten.
 )
 
 type Paxos struct {
@@ -55,6 +66,16 @@ type Paxos struct {
 
 
 	// Your data here.
+	instances map[int]*instance
+	done      map[int]int
+}
+
+type instance struct {
+	status  Fate
+	n_p      int
+	n_a      int
+	v_a      interface{}
+	n_p_consensus int
 }
 
 //
@@ -93,6 +114,341 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 	return false
 }
 
+func (px *Paxos) Proposer(proposeArgs *ProposeArgs, proposeReply *ProposeReply) {	
+	px.proposer(proposeArgs.Instance, proposeArgs.Value)
+}
+
+func (px *Paxos) proposer(instance int, value interface{}) {	
+	status, _ := px.Status(instance)
+	for status == Fate(3) && px.dead == 0 {
+		
+		validProposal := px.generateValidProposal(instance)
+		
+		responses := make([]*PrepareReply, len(px.peers))
+		for i, _ := range responses {
+			responses[i] = &PrepareReply{false, -1, -1, nil, -1, -1}
+		}
+
+		done := -1
+		px.mu.Lock()
+		if s, ok := px.done[px.me]; ok {
+			done = s
+		}
+		px.mu.Unlock()
+
+		// PREPARE
+		px.sendPrepare(instance, validProposal, done, responses)
+		// PREPARE
+
+		unaccepted := 0
+		for _, r := range responses {
+			if !r.OK {
+				unaccepted++
+				
+				// IF NOT HIGHEST RESTART
+				if px.highestConsensus(instance, r.N_P) {
+					px.Start(instance, value)
+					return
+				}
+			}
+		}
+
+		if unaccepted >= MinMajority {
+			time.Sleep(time.Duration(rand.Int()%30) * time.Millisecond)
+			px.Start(instance, value)
+			return
+		}
+
+
+		value = px.chooseHighest(responses, value)
+
+		done = -1
+		px.mu.Lock()
+		if s, ok := px.done[px.me]; ok {
+			done = s
+		}
+		px.mu.Unlock()
+		
+		// ACCEPTANCE (PROMISING) IF LESS THAN MAJORITY, RESTART
+		if px.acceptanceCount(instance, value, validProposal, done) < MinMajority {
+			px.Start(instance, value)
+			return
+		}
+		// ACCEPTANCE (PROMISING) IF LESS THAN MAJORITY, RESTART
+
+		// DECISION IF LESS THAN MAJORITY, RESTART
+		if px.decisionCount(instance, value) < MinMajority {
+			px.Start(instance, value)
+			return
+		}
+		// DECISION IF LESS THAN MAJORITY, RESTART
+
+		status, _ = px.Status(instance)
+	}
+}
+
+// **************************************************
+// ******************* PREPARATION *******************
+// **************************************************
+
+
+func (px *Paxos) sendPrepare(instance int, validProposal int, done int, responses []*PrepareReply) {	
+	for i, p := range px.peers {
+		// SELF PREPARE NO RPC REQUIRED
+		if i == px.me {
+			reply := &PrepareReply{}			
+			if px.PrepareRPC(&PrepareArgs{instance, validProposal, px.me, done}, reply) == nil {
+				responses[reply.From] = reply
+				px.setDone(reply.From, reply.Done)
+			}
+		// PREPARATION FOR PEERS
+		} else {
+			if ok, reply := px.sendPrepareToPeers(instance, p, validProposal); ok {
+				responses[reply.From] = reply
+				px.setDone(reply.From, reply.Done)
+			}
+		}
+	}
+}
+
+func (px *Paxos) sendPrepareToPeers(instance int, dest string, validProposal int) (bool, *PrepareReply) {
+	var reply PrepareReply
+	done := -1
+	px.mu.Lock()
+	if val, ok := px.done[px.me]; ok {
+		done = val
+	}
+	px.mu.Unlock()
+	args := &PrepareArgs{instance, validProposal, px.me, done}
+	ok := call(dest, "Paxos.PrepareRPC", args, &reply)
+	return ok, &reply
+}
+
+func (px *Paxos) PrepareRPC(args *PrepareArgs, reply *PrepareReply) error {
+	reply.From = px.me
+	px.setDone(args.From, args.Done)
+	px.mu.Lock()
+	if val, ok := px.done[px.me]; ok {
+		reply.Done = val
+	} else {
+		reply.Done = 0
+	}
+	i := px.instances[args.Instance]
+	if i == nil {
+		px.instances[args.Instance] = &instance{Fate(3), -1, -1, nil, -1}
+		i = px.instances[args.Instance]
+	}
+
+	if args.N_P > i.n_p {
+		i.n_p = args.N_P
+		reply.OK = true
+	} else {
+		reply.OK = false
+	}
+
+	reply.N_A = i.n_a
+	reply.V_A = i.v_a
+	reply.N_P = i.n_p
+	px.mu.Unlock()
+	return nil
+}
+
+// **************************************************
+// ******************* PREPARATION *******************
+// **************************************************
+
+
+// **************************************************
+// ******************* ACCEPTANCE *******************
+// **************************************************
+
+func (px *Paxos) sendAccept(instance int, dest string, n_a int, v_a interface{}) (bool, *AcceptReply) {
+	var reply AcceptReply
+	done := 0
+	px.mu.Lock()
+	if val, ok := px.done[px.me]; ok {
+		done = val
+	}
+	px.mu.Unlock()
+	args := &AcceptArgs{instance, n_a, v_a, px.me, done}
+	ok := call(dest, "Paxos.AcceptRPC", args, &reply)
+	return ok, &reply
+}
+
+func (px *Paxos) AcceptRPC(args *AcceptArgs, reply *AcceptReply) error {
+	reply.From = px.me
+	px.setDone(args.From, args.Done)
+	px.mu.Lock()
+
+	if val, ok := px.done[px.me]; ok {
+		reply.Done = val
+	} else {
+		reply.Done = 0
+	}
+
+	i := px.instances[args.Instance]
+	if i == nil {
+		reply.OK = false
+	} else {
+		if args.N_A >= i.n_p {
+			i.n_p = args.N_A
+			i.n_a = args.N_A
+			i.v_a = args.V_A
+			reply.OK = true
+			reply.N = i.n_a
+			reply.V_A = i.v_a
+		} else {
+			reply.OK = false
+		}
+	}
+	px.mu.Unlock()
+	return nil
+}
+
+
+func (px * Paxos) acceptanceCount(instance int, value interface{}, validProposal int, done int) int {
+	nAccepted := 0
+
+	for i, p := range px.peers {
+		// SELF ACCEPTANCE NO RPC REQUIRED
+		if i == px.me {
+			reply := &AcceptReply{}
+			if px.AcceptRPC(&AcceptArgs{instance, validProposal, value, px.me, done}, reply) == nil {
+				if reply.OK {
+					px.mu.Lock()
+					nAccepted++
+					px.mu.Unlock()
+					px.setDone(reply.From, reply.Done)
+				}
+			}
+		// ACCEPTANCE FOR PEERS
+		} else {
+			if ok, r := px.sendAccept(instance, p, validProposal, value); ok {
+				px.setDone(r.From, r.Done)
+				if r.OK {
+					px.mu.Lock()
+					nAccepted++
+					px.mu.Unlock()
+				}
+			}
+		}
+	}
+
+	return nAccepted
+
+}
+
+// **************************************************
+// ******************* ACCEPTANCE *******************
+// **************************************************
+
+// **************************************************
+// ******************* DECISION *********************
+// **************************************************
+
+func (px *Paxos) sendDecide(instance int, dest string, val interface{}) (bool, *DecideReply) {
+	var reply DecideReply
+	ok := call(dest, "Paxos.DecideRPC", &DecideArgs{instance, val}, &reply)
+	return ok, &reply
+}
+
+func (px *Paxos) DecideRPC(args *DecideArgs, reply *DecideReply) error {
+	px.mu.Lock()
+	i := px.instances[args.Instance]
+	if i != nil {
+		i.v_a = args.Value
+		i.status = Fate(1)
+		reply.OK = true
+	} else {
+		reply.OK = false
+	}
+	px.mu.Unlock()
+	return nil
+}
+
+func (px *Paxos) decisionCount(instance int, value interface{}) int {
+	nDecided := 0
+		
+	for i, p := range px.peers {
+		// SELF DECISION NO RPC REQUIRED
+		if i == px.me {
+			reply := &DecideReply{}
+			if px.DecideRPC(&DecideArgs{instance, value}, reply) == nil && reply.OK {
+				px.mu.Lock()
+				nDecided++
+				px.mu.Unlock()
+			}
+		// DECISION FOR PEERS	
+		} else {
+			ok, r := px.sendDecide(instance, p, value)
+			if ok && r.OK {
+				px.mu.Lock()
+				nDecided++
+				px.mu.Unlock()
+			}
+		}
+	}
+
+	return nDecided
+}
+
+// **************************************************
+// ******************* DECISION *********************
+// **************************************************
+
+func (px *Paxos) generateValidProposal(instance int) int {
+	px.mu.Lock()
+	validProposal := instance + px.me
+	px.mu.Unlock()
+
+	for h := px.highestProposal(instance); validProposal <= h; {
+		px.mu.Lock()
+		instance++
+		validProposal = instance + px.me
+		px.mu.Unlock()
+	}
+	return validProposal
+}
+
+func (px *Paxos) chooseHighest(r []*PrepareReply, value interface{}) interface{} {
+	max_id := -1
+	var max_value interface{}
+
+	for _, v := range r {
+		if v.OK && v.N_A > max_id {
+			max_id = v.N_A
+			max_value = v.V_A
+		}
+	}
+	
+	if max_value == nil {
+		max_value = value
+	}
+	return max_value
+}
+
+func (px *Paxos) highestProposal(instance int) int {
+	result := -1
+	px.mu.Lock()
+	if px.instances[instance] != nil {
+		if result = px.instances[instance].n_p; px.instances[instance].n_p > px.instances[instance].n_p_consensus {
+			result = px.instances[instance].n_p_consensus
+		}
+	}
+	px.mu.Unlock()
+	return result
+}
+
+func (px *Paxos) highestConsensus(instance int, n_p int) bool {
+	success := false
+	px.mu.Lock()
+	if px.instances[instance] != nil && n_p > px.instances[instance].n_p_consensus {
+		px.instances[instance].n_p_consensus = n_p
+		success = true
+	}
+	px.mu.Unlock()
+	return success
+}
 
 //
 // the application wants paxos to start agreement on
@@ -102,7 +458,26 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 // is reached.
 //
 func (px *Paxos) Start(seq int, v interface{}) {
-	// Your code here.
+	if seq >= px.Min() {
+		// call(strconv.Itoa(px.me), "Paxos.Proposer", &ProposeArgs{seq, v}, &ProposeReply{})
+		go px.proposer(seq, v)
+	}
+}
+
+// VARIATION OF DONE TO PREVENT FORGETTING
+func (px *Paxos) setDone(peer int, instance int) {
+	px.mu.Lock()
+	px.done[peer] = instance
+	px.mu.Unlock()
+	min := px.Min()
+	keys := px.getKeys(px.instances)
+	for _, k := range keys {
+		if k < min {
+			px.mu.Lock()
+			delete(px.instances, k)
+			px.mu.Unlock()
+		}
+	}
 }
 
 //
@@ -111,8 +486,22 @@ func (px *Paxos) Start(seq int, v interface{}) {
 //
 // see the comments for Min() for more explanation.
 //
+// ONLY USED FOR TESTS AND FROM KVPAXOS
 func (px *Paxos) Done(seq int) {
-	// Your code here.
+	px.mu.Lock()
+	px.done[px.me] = seq
+	px.mu.Unlock()
+}
+
+// https://stackoverflow.com/questions/21362950/golang-getting-a-slice-of-keys-from-a-map
+func (px *Paxos) getKeys(instances map[int]*instance) []int {
+	px.mu.Lock()
+	keys := make([]int, len(instances))
+	for key, _ := range instances {
+		keys = append(keys, key)
+	}
+	px.mu.Unlock()
+	return keys
 }
 
 //
@@ -121,8 +510,15 @@ func (px *Paxos) Done(seq int) {
 // this peer.
 //
 func (px *Paxos) Max() int {
-	// Your code here.
-	return 0
+	keys := px.getKeys(px.instances)
+	
+	max := -1
+	for i := range keys {
+		if keys[i] > max {
+			max = keys[i]
+		}
+	}
+	return max
 }
 
 //
@@ -153,9 +549,21 @@ func (px *Paxos) Max() int {
 // missed -- the other peers therefor cannot forget these
 // instances.
 //
-func (px *Paxos) Min() int {
-	// You code here.
-	return 0
+func (px *Paxos) Min() int {		
+	if len(px.done) < len(px.peers) {
+		return 0
+	}
+	// TO PREVENT CONCURRENT MAP READS
+	px.mu.Lock()
+	min := px.done[0]
+	for _, instance := range px.done {
+		if instance < min {
+			min = instance
+		}
+	}
+	px.mu.Unlock()
+	// TO PREVENT CONCURRENT MAP READS
+	return min + 1
 }
 
 //
@@ -166,8 +574,17 @@ func (px *Paxos) Min() int {
 // it should not contact other Paxos peers.
 //
 func (px *Paxos) Status(seq int) (Fate, interface{}) {
-	// Your code here.
-	return Pending, nil
+	status := Fate(3)
+	var value interface{} = nil
+	// TO PREVENT CONCURRENT MAP READS
+	px.mu.Lock()
+	if px.instances[seq] != nil {
+		status = px.instances[seq].status
+		value = px.instances[seq].v_a
+	}
+	px.mu.Unlock()
+	// TO PREVENT CONCURRENT MAP READS
+	return status, value
 }
 
 
@@ -214,8 +631,11 @@ func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
 	px.peers = peers
 	px.me = me
 
+	MinMajority = len(px.peers)/2 + 1
 
 	// Your initialization code here.
+	px.instances = make(map[int]*instance)
+	px.done = make(map[int]int)	
 
 	if rpcs != nil {
 		// caller will create socket &c
